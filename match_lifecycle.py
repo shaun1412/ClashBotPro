@@ -77,16 +77,21 @@ def click_roi_centre(hwnd, roi: tuple, delay: float = 0.3):
 #  SCREEN COLOUR SIGNATURES
 # ══════════════════════════════════════════════════════════════════════════════
 
-# "Winner!" banner — wide strip covering the top portion of the screen.
-# We scan broadly so it doesn't matter exactly where the banner appears.
-WINNER_ROI = (0.10, 0.03, 0.90, 0.30)
+# "Winner!" text can appear ANYWHERE on screen — we scan the full client area
+# via a grid of overlapping tiles and take the max blue / max pink fraction.
+WINNER_FULL_SCREEN = True   # if True, use grid scan; else use legacy WINNER_ROI strip
+WINNER_ROI = (0.10, 0.03, 0.90, 0.30)   # legacy top strip (used when WINNER_FULL_SCREEN is False)
 
-# WE win  -> "Winner!" is BLUE
+# Grid scan: tile size and step as fraction of screen (overlapping windows)
+WINNER_TILE_W, WINNER_TILE_H = 0.35, 0.25   # each tile 35% x 25% of screen
+WINNER_STEP_W, WINNER_STEP_H = 0.12, 0.10   # step so we don't miss the banner
+
+# WE win  -> "Winner!" is BLUE (blueish shade)
 WIN_BLUE_LO     = np.array([ 30,  80, 160], dtype=np.uint8)
 WIN_BLUE_HI     = np.array([130, 180, 255], dtype=np.uint8)
 WIN_BLUE_THRESH = 0.04
 
-# THEY win -> "Winner!" is PINK / MAGENTA
+# THEY win -> "Winner!" is PINK (pinkish shade)
 WIN_PINK_LO     = np.array([180,  30, 120], dtype=np.uint8)
 WIN_PINK_HI     = np.array([255, 130, 220], dtype=np.uint8)
 WIN_PINK_THRESH = 0.04
@@ -120,6 +125,38 @@ ELIXIR_THRESH = 0.05
 #  STATE DETECTORS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _winner_scan_full_screen(arr: np.ndarray) -> tuple[float, float]:
+    """
+    Scan the full screen with overlapping tiles; return (max_blue_frac, max_pink_frac).
+    So wherever the 'Winner!' text appears (blue or pink), we catch it.
+    """
+    h, w = arr.shape[:2]
+    tw = max(1, int(w * WINNER_TILE_W))
+    th = max(1, int(h * WINNER_TILE_H))
+    sw = max(1, int(w * WINNER_STEP_W))
+    sh = max(1, int(h * WINNER_STEP_H))
+    max_blue, max_pink = 0.0, 0.0
+    for y0 in range(0, max(1, h - th + 1), sh):
+        for x0 in range(0, max(1, w - tw + 1), sw):
+            tile = arr[y0 : y0 + th, x0 : x0 + tw]
+            if tile.size == 0:
+                continue
+            b = color_frac(tile, WIN_BLUE_LO, WIN_BLUE_HI)
+            p = color_frac(tile, WIN_PINK_LO, WIN_PINK_HI)
+            max_blue = max(max_blue, b)
+            max_pink = max(max_pink, p)
+    return max_blue, max_pink
+
+
+def _winner_scan_roi(arr: np.ndarray) -> tuple[float, float]:
+    """Legacy: single ROI at top of screen."""
+    region = crop(arr, WINNER_ROI)
+    return (
+        color_frac(region, WIN_BLUE_LO, WIN_BLUE_HI),
+        color_frac(region, WIN_PINK_LO, WIN_PINK_HI),
+    )
+
+
 def is_match_live(hwnd) -> bool:
     """True while inside a live match (elixir bar is visible)."""
     arr = grab_full(hwnd)
@@ -129,38 +166,41 @@ def is_match_live(hwnd) -> bool:
 def is_end_screen(hwnd) -> bool:
     """
     True when the post-match results overlay is on screen.
-    Checks for the golden background OR either Winner banner colour.
+    Checks for the golden background OR either Winner banner colour (anywhere on screen).
     """
-    arr       = grab_full(hwnd)
-    gold      = color_frac(crop(arr, END_ROI),    END_GOLD_LO, END_GOLD_HI)
-    blue      = color_frac(crop(arr, WINNER_ROI), WIN_BLUE_LO, WIN_BLUE_HI)
-    pink      = color_frac(crop(arr, WINNER_ROI), WIN_PINK_LO, WIN_PINK_HI)
+    arr  = grab_full(hwnd)
+    gold = color_frac(crop(arr, END_ROI), END_GOLD_LO, END_GOLD_HI)
+    if WINNER_FULL_SCREEN:
+        blue, pink = _winner_scan_full_screen(arr)
+    else:
+        blue, pink = _winner_scan_roi(arr)
     return gold >= END_THRESH or blue >= WIN_BLUE_THRESH or pink >= WIN_PINK_THRESH
 
 
 def parse_result(hwnd) -> dict:
     """
-    Determine win/loss from the colour of the Winner! banner.
-      Blue  Winner! -> WE won
-      Pink  Winner! -> THEY won
+    Determine win/loss from the colour of the 'Winner!' text (can be anywhere on screen).
+      Blueish 'Winner!' -> WE won
+      Pinkish 'Winner!' -> THEY won
     Returns { "won": bool }
     """
-    arr       = grab_full(hwnd)
-    region    = crop(arr, WINNER_ROI)
-    blue_frac = color_frac(region, WIN_BLUE_LO, WIN_BLUE_HI)
-    pink_frac = color_frac(region, WIN_PINK_LO, WIN_PINK_HI)
+    arr = grab_full(hwnd)
+    if WINNER_FULL_SCREEN:
+        blue_frac, pink_frac = _winner_scan_full_screen(arr)
+    else:
+        blue_frac, pink_frac = _winner_scan_roi(arr)
 
-    print(f"[Lifecycle] Winner banner — blue={blue_frac:.3f}  pink={pink_frac:.3f}")
+    print(f"[Lifecycle] Winner (full-screen scan) — blue={blue_frac:.3f}  pink={pink_frac:.3f}")
 
     if blue_frac >= WIN_BLUE_THRESH and blue_frac > pink_frac:
-        print("[Lifecycle] -> VICTORY (blue banner)")
+        print("[Lifecycle] -> VICTORY (blue Winner)")
         return {"won": True}
     elif pink_frac >= WIN_PINK_THRESH and pink_frac > blue_frac:
-        print("[Lifecycle] -> DEFEAT (pink banner)")
+        print("[Lifecycle] -> DEFEAT (pink Winner)")
         return {"won": False}
     else:
-        print("[Lifecycle] -> Could not read banner clearly — defaulting to DEFEAT")
-        print("             Tweak WIN_BLUE_THRESH / WIN_PINK_THRESH if this recurs.")
+        print("[Lifecycle] -> Could not read Winner clearly — defaulting to DEFEAT")
+        print("             Tweak WIN_BLUE_THRESH / WIN_PINK_THRESH or color ranges if this recurs.")
         return {"won": False}
 
 

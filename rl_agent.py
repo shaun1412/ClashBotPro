@@ -50,7 +50,7 @@ from bluestacks_control import (
 from match_lifecycle import (
     is_match_live,
     is_end_screen,
-    wait_for_match_end,
+    wait_for_match_start,
     handle_match_end,
 )
 
@@ -572,7 +572,16 @@ class ClashRoyaleAgent:
 
     # ── Training loop ────────────────────────────────────────────────────────
 
-    def train(self, n_matches: int = 200):
+    def train(self, n_matches: int = 200, wait_for_first_match: bool = True):
+        """
+        Full training loop:
+          1. You start the first game (click Battle in Clash Royale).
+          2. This script waits for the match to start (elixir bar visible).
+          3. Agent plays the match, gets rewards, learns.
+          4. On end screen: detect win/loss (blue vs pink 'Winner!'), click OK, click Battle.
+          5. Waits for the next match to start, then repeats from step 3.
+        Repeats until n_matches is reached.
+        """
         hwnd = find_bluestacks_window()
         focus_window(hwnd)
 
@@ -581,14 +590,21 @@ class ClashRoyaleAgent:
         print(f"║   Deck: {', '.join(CARD_KEYS[:4])}...")
         print(f"║   Actions: {N_ACTIONS}  |  Matches: {n_matches}")
         print("╚══════════════════════════════════════════╝\n")
-        print("⚠  Make sure a match is in progress before the loop starts!\n")
-        time.sleep(5)
+        if wait_for_first_match:
+            print("⚠  Click Battle in Clash Royale now. Waiting for first match to start...\n")
+            if not wait_for_match_start(hwnd, timeout=90.0):
+                print("[Train] First match did not start in time. Exiting.")
+                return []
+            print("[Train] First match started. Beginning training loop.\n")
+        else:
+            print("⚠  Make sure a match is already in progress!\n")
+            time.sleep(5)
 
         results = []
-        for _ in range(n_matches):
+        for i in range(n_matches):
             summary = self.run_match(hwnd)
             results.append(summary)
-            # match_lifecycle.handle_match_end() already navigates back to next match
+            # handle_match_end() already: OK → Battle → wait_for_match_start for next match
 
         print("\n✓ Training complete.")
         return results
