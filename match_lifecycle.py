@@ -2,17 +2,20 @@
 match_lifecycle.py
 ------------------
 Handles the full match lifecycle for the Clash Royale RL agent:
-  1. Detect match end via the "Winner!" banner
-  2. Determine win/loss by the banner colour (blue = we won, pink = they won)
+  1. Detect match end via the "Winner!" screen (ref images or gold fallback)
+  2. Determine win/loss by blue vs pink Winner ref match (or colour fallback)
   3. Click OK / Continue
   4. Click Battle again
   5. Wait for the next match to start (elixir bar reappears)
 
-No reference screenshots needed — everything is colour-based.
+Winner detection (preferred): add your own ref images for reliable detection:
+  - clash_bot/lifecycle_refs/winner_blue.png   — screenshot/crop when YOU win (blue Winner)
+  - clash_bot/lifecycle_refs/winner_pink.png   — screenshot/crop when OPPONENT wins (pink Winner)
+Crop just the "Winner!" banner/text area from each screen; multi-scale matching is used.
 
 Standalone usage:
     python match_lifecycle.py --test      # print current screen state
-    python match_lifecycle.py --capture   # save OK / Battle button refs
+    python match_lifecycle.py --capture   # save OK / Battle / Winner refs
 """
 
 import sys
@@ -120,6 +123,18 @@ ELIXIR_LO     = np.array([200,  50, 150], dtype=np.uint8)
 ELIXIR_HI     = np.array([255, 160, 255], dtype=np.uint8)
 ELIXIR_THRESH = 0.05
 
+# Winner ref images (optional but recommended — use your screenshots for reliable detection)
+WINNER_REF_BLUE = REF_DIR / "winner_blue.png"   # crop of "Winner!" when agent wins (blue)
+WINNER_REF_PINK = REF_DIR / "winner_pink.png"   # crop of "Winner!" when opponent wins (pink)
+WINNER_REF_THRESH = 0.60   # min template match score to consider "end screen" / win or loss
+WINNER_REF_SCALES = (0.5, 0.7, 0.9, 1.1, 1.3)  # multi-scale matching for different resolutions
+# ROI to crop when capturing winner refs (banner usually in upper-center): x1, y1, x2, y2 frac
+WINNER_CAPTURE_ROI = (0.15, 0.12, 0.85, 0.45)
+
+# Cached ref templates (loaded once)
+_winner_ref_blue_gray = None
+_winner_ref_pink_gray = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STATE DETECTORS
@@ -157,6 +172,56 @@ def _winner_scan_roi(arr: np.ndarray) -> tuple[float, float]:
     )
 
 
+def _load_winner_refs():
+    """Load winner ref images once (grayscale for template matching)."""
+    global _winner_ref_blue_gray, _winner_ref_pink_gray
+    if _winner_ref_blue_gray is None and WINNER_REF_BLUE.exists():
+        img = cv2.imread(str(WINNER_REF_BLUE), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            _winner_ref_blue_gray = img
+    if _winner_ref_pink_gray is None and WINNER_REF_PINK.exists():
+        img = cv2.imread(str(WINNER_REF_PINK), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            _winner_ref_pink_gray = img
+
+
+def _winner_template_scores(arr: np.ndarray) -> tuple[float, float]:
+    """
+    Match winner ref images (blue and pink) against the screen at multiple scales.
+    Returns (blue_score, pink_score) in [0, 1]. Uses refs if both exist; else (0, 0).
+    """
+    _load_winner_refs()
+    if _winner_ref_blue_gray is None or _winner_ref_pink_gray is None:
+        return 0.0, 0.0
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape[:2]
+    blue_best, pink_best = 0.0, 0.0
+    for ref_gray, best in [( _winner_ref_blue_gray, "blue"), (_winner_ref_pink_gray, "pink")]:
+        ref_h, ref_w = ref_gray.shape[:2]
+        for scale in WINNER_REF_SCALES:
+            tw = max(10, min(int(ref_w * scale), w - 5))
+            th = max(10, min(int(ref_h * scale), h - 5))
+            if tw > w or th > h:
+                continue
+            ref_scaled = cv2.resize(ref_gray, (tw, th))
+            try:
+                result = cv2.matchTemplate(gray, ref_scaled, cv2.TM_CCOEFF_NORMED)
+                val = float(result.max())
+            except cv2.error:
+                val = 0.0
+            if best == "blue":
+                blue_best = max(blue_best, val)
+            else:
+                pink_best = max(pink_best, val)
+    return blue_best, pink_best
+
+
+def _winner_refs_available() -> bool:
+    """True if both winner ref images exist and loaded."""
+    _load_winner_refs()
+    return _winner_ref_blue_gray is not None and _winner_ref_pink_gray is not None
+
+
 def is_match_live(hwnd) -> bool:
     """True while inside a live match (elixir bar is visible)."""
     arr = grab_full(hwnd)
@@ -165,43 +230,53 @@ def is_match_live(hwnd) -> bool:
 
 def is_end_screen(hwnd) -> bool:
     """
-    True when the post-match results overlay is on screen.
-    Checks for the golden background OR either Winner banner colour (anywhere on screen).
+    True when the post-match "Winner!" screen is visible.
+    Preferred: template match your winner_blue.png / winner_pink.png refs (reliable, no gold).
+    Fallback: golden result-screen background (gold >= END_THRESH).
     """
-    arr  = grab_full(hwnd)
+    arr = grab_full(hwnd)
+    if _winner_refs_available():
+        blue_score, pink_score = _winner_template_scores(arr)
+        if blue_score >= WINNER_REF_THRESH or pink_score >= WINNER_REF_THRESH:
+            return True
+        return False
     gold = color_frac(crop(arr, END_ROI), END_GOLD_LO, END_GOLD_HI)
-    if WINNER_FULL_SCREEN:
-        blue, pink = _winner_scan_full_screen(arr)
-    else:
-        blue, pink = _winner_scan_roi(arr)
-    return gold >= END_THRESH or blue >= WIN_BLUE_THRESH or pink >= WIN_PINK_THRESH
+    return gold >= END_THRESH
 
 
 def parse_result(hwnd) -> dict:
     """
-    Determine win/loss from the colour of the 'Winner!' text (can be anywhere on screen).
-      Blueish 'Winner!' -> WE won
-      Pinkish 'Winner!' -> THEY won
+    Determine win/loss from the end screen.
+    Preferred: template match winner_blue vs winner_pink refs (your screenshots).
+    Fallback: colour scan (blue vs pink fraction).
     Returns { "won": bool }
     """
     arr = grab_full(hwnd)
+    if _winner_refs_available():
+        blue_score, pink_score = _winner_template_scores(arr)
+        print(f"[Lifecycle] Winner (ref match) — blue={blue_score:.3f}  pink={pink_score:.3f}")
+        if blue_score >= WINNER_REF_THRESH and blue_score > pink_score:
+            print("[Lifecycle] -> VICTORY (blue Winner ref)")
+            return {"won": True}
+        if pink_score >= WINNER_REF_THRESH and pink_score > blue_score:
+            print("[Lifecycle] -> DEFEAT (pink Winner ref)")
+            return {"won": False}
+        print("[Lifecycle] -> No clear ref match — defaulting to DEFEAT")
+        return {"won": False}
+    # Colour fallback
     if WINNER_FULL_SCREEN:
         blue_frac, pink_frac = _winner_scan_full_screen(arr)
     else:
         blue_frac, pink_frac = _winner_scan_roi(arr)
-
-    print(f"[Lifecycle] Winner (full-screen scan) — blue={blue_frac:.3f}  pink={pink_frac:.3f}")
-
+    print(f"[Lifecycle] Winner (colour fallback) — blue={blue_frac:.3f}  pink={pink_frac:.3f}")
     if blue_frac >= WIN_BLUE_THRESH and blue_frac > pink_frac:
         print("[Lifecycle] -> VICTORY (blue Winner)")
         return {"won": True}
-    elif pink_frac >= WIN_PINK_THRESH and pink_frac > blue_frac:
+    if pink_frac >= WIN_PINK_THRESH and pink_frac > blue_frac:
         print("[Lifecycle] -> DEFEAT (pink Winner)")
         return {"won": False}
-    else:
-        print("[Lifecycle] -> Could not read Winner clearly — defaulting to DEFEAT")
-        print("             Tweak WIN_BLUE_THRESH / WIN_PINK_THRESH or color ranges if this recurs.")
-        return {"won": False}
+    print("[Lifecycle] -> Could not read Winner — defaulting to DEFEAT")
+    return {"won": False}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -324,8 +399,8 @@ def handle_match_end(hwnd,
 #  OPTIONAL BUTTON REFERENCE CAPTURE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def capture_refs(hwnd):
-    """Save greyscale crops of OK and Battle buttons for optional template matching."""
+def capture_refs(hwnd, include_winner: bool = False):
+    """Save refs for OK, Battle, and optionally Winner (blue/pink) screens."""
     for name, roi in [("ok_button", OK_ROI), ("battle_button", BATTLE_ROI)]:
         input(f"\n[Capture] Show '{name}' on screen then press ENTER...")
         arr    = grab_full(hwnd)
@@ -334,7 +409,15 @@ def capture_refs(hwnd):
         out    = REF_DIR / f"{name}.png"
         cv2.imwrite(str(out), gray)
         print(f"   Saved -> {out}")
-    print("\n[Capture] Done. No result screenshots needed — win/loss is colour-based.\n")
+    if include_winner:
+        for name, path in [("blue Winner (YOU won)", WINNER_REF_BLUE), ("pink Winner (opponent won)", WINNER_REF_PINK)]:
+            input(f"\n[Capture] Show '{name}' screen then press ENTER...")
+            arr    = grab_full(hwnd)
+            region = crop(arr, WINNER_CAPTURE_ROI)
+            gray   = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+            cv2.imwrite(str(path), gray)
+            print(f"   Saved -> {path}")
+    print("\n[Capture] Done. Winner refs (winner_blue.png / winner_pink.png) are used for end-screen and win/loss detection.\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -357,9 +440,14 @@ if __name__ == "__main__":
     hwnd = _find_bluestacks()
 
     if "--capture" in sys.argv:
-        capture_refs(hwnd)
+        capture_refs(hwnd, include_winner="--winner" in sys.argv)
     elif "--test" in sys.argv:
         print("\n[Test] Current screen state:")
+        print(f"  winner refs   : {_winner_refs_available()} (winner_blue.png, winner_pink.png)")
+        if _winner_refs_available():
+            arr = grab_full(hwnd)
+            b, p = _winner_template_scores(arr)
+            print(f"  winner scores : blue={b:.3f}  pink={p:.3f}  (threshold={WINNER_REF_THRESH})")
         print(f"  is_match_live : {is_match_live(hwnd)}")
         print(f"  is_end_screen : {is_end_screen(hwnd)}")
         if is_end_screen(hwnd):
@@ -367,4 +455,5 @@ if __name__ == "__main__":
     else:
         print("Usage:")
         print("  python match_lifecycle.py --test")
-        print("  python match_lifecycle.py --capture")
+        print("  python match_lifecycle.py --capture           # OK + Battle refs")
+        print("  python match_lifecycle.py --capture --winner  # + blue/pink Winner refs")
