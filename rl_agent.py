@@ -1,0 +1,659 @@
+"""
+rl_agent.py
+-----------
+Script 2: DQN-based RL agent for Clash Royale.
+Integrates with bluestacks_control.py for action execution.
+
+Deck: PEKKA · Battle Ram · Bandit · Royal Ghost · E-Spirit · Zap · Arrows · Wizard
+
+Folder structure expected (run setup_folders.py to create automatically):
+    clash_bot/
+    ├── card_refs/          ← one reference PNG per card (for card detection)
+    │     pekka.png, battle_ram.png, bandit.png, royal_ghost.png,
+    │     e_spirit.png, zap.png, arrows.png, wizard.png
+    ├── screenshots/        ← saved raw game screenshots (optional debug)
+    ├── checkpoints/        ← model weights saved during training
+    └── logs/               ← reward / loss CSV logs
+
+Requirements:
+    pip install torch torchvision opencv-python pywin32 pyautogui pillow numpy
+
+Run:
+    python rl_agent.py
+"""
+
+import os
+import csv
+import time
+import random
+import collections
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import ImageGrab, Image
+
+# ── local import ──────────────────────────────────────────────────────────────
+from bluestacks_control import (
+    find_bluestacks_window,
+    focus_window,
+    get_window_rect,
+    screenshot_window,
+    place_card,
+    wait_action,
+    ARENA_ZONES,
+)
+from match_lifecycle import (
+    is_match_live,
+    is_end_screen,
+    wait_for_match_end,
+    handle_match_end,
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+
+BASE_DIR        = Path("clash_bot")
+CARD_REF_DIR    = BASE_DIR / "card_refs"
+SCREENSHOT_DIR  = BASE_DIR / "screenshots"
+CHECKPOINT_DIR  = BASE_DIR / "checkpoints"
+LOG_DIR         = BASE_DIR / "logs"
+
+for d in [CARD_REF_DIR, SCREENSHOT_DIR, CHECKPOINT_DIR, LOG_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DECK DEFINITION
+#  Each card: internal key → { display name, elixir cost, slot index (0-3) }
+#  The agent always sees 4 cards in hand; slot index maps to card_slot 1-4
+#  in bluestacks_control.place_card().
+# ══════════════════════════════════════════════════════════════════════════════
+
+DECK = {
+    "pekka":        {"name": "P.E.K.K.A",     "elixir": 7},
+    "battle_ram":   {"name": "Battle Ram",     "elixir": 4},
+    "bandit":       {"name": "Bandit",         "elixir": 3},
+    "royal_ghost":  {"name": "Royal Ghost",    "elixir": 3},
+    "e_spirit":     {"name": "Electro Spirit", "elixir": 1},
+    "zap":          {"name": "Zap",            "elixir": 2},
+    "arrows":       {"name": "Arrows",         "elixir": 3},
+    "wizard":       {"name": "Wizard",         "elixir": 5},
+}
+
+CARD_KEYS = list(DECK.keys())   # fixed ordering used throughout
+N_CARDS   = len(CARD_KEYS)      # 8
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ACTION SPACE
+#  action = card_index (0-7) × zone_index (0-8) + 1 WAIT action
+#  Total: 8 cards × 9 zones + 1 = 73 actions
+# ══════════════════════════════════════════════════════════════════════════════
+
+ZONE_KEYS   = list(ARENA_ZONES.keys())   # 9 zones from bluestacks_control
+N_ZONES     = len(ZONE_KEYS)             # 9
+WAIT_ACTION = N_CARDS * N_ZONES          # index 72 → do nothing
+N_ACTIONS   = N_CARDS * N_ZONES + 1     # 73
+
+def decode_action(action_idx: int) -> tuple[str | None, str | None]:
+    """
+    Decode a flat action index into (card_key, zone_key).
+    Returns (None, None) for the WAIT action.
+    """
+    if action_idx == WAIT_ACTION:
+        return None, None
+    card_idx = action_idx // N_ZONES
+    zone_idx = action_idx  % N_ZONES
+    return CARD_KEYS[card_idx], ZONE_KEYS[zone_idx]
+
+
+def get_valid_actions(hand: list[str], elixir: float) -> list[int]:
+    """
+    Return all action indices valid given the current hand and elixir count.
+    A card action is valid if:
+      - that card is currently in hand, AND
+      - the player has enough elixir to play it.
+    WAIT is always valid.
+    """
+    valid = [WAIT_ACTION]
+    for card_key in hand:
+        card_idx = CARD_KEYS.index(card_key)
+        cost     = DECK[card_key]["elixir"]
+        if elixir >= cost:
+            for zone_idx in range(N_ZONES):
+                valid.append(card_idx * N_ZONES + zone_idx)
+    return valid
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STATE PREPROCESSING
+#  State tensor shape: [C=3+1, H=84, W=84]
+#    channels 0-2 : battlefield screenshot (RGB, downsampled)
+#    channel  3   : elixir heatmap (scalar broadcast to full image)
+# ══════════════════════════════════════════════════════════════════════════════
+
+IMG_H, IMG_W = 84, 84
+
+def preprocess_screenshot(img: Image.Image) -> np.ndarray:
+    """Resize and normalise a PIL screenshot → float32 numpy [3, 84, 84]."""
+    img = img.resize((IMG_W, IMG_H), Image.BILINEAR)
+    arr = np.array(img, dtype=np.float32) / 255.0   # H×W×3
+    return arr.transpose(2, 0, 1)                    # 3×H×W
+
+
+def build_state_tensor(img: Image.Image, elixir: float) -> torch.Tensor:
+    """
+    Combine visual observation with elixir into a [4, 84, 84] state tensor.
+    The elixir channel is normalised to [0, 1] (max elixir = 10).
+    """
+    visual   = preprocess_screenshot(img)            # 3×84×84
+    elixir_n = float(elixir) / 10.0
+    elixir_ch = np.full((1, IMG_H, IMG_W), elixir_n, dtype=np.float32)  # 1×84×84
+    state = np.concatenate([visual, elixir_ch], axis=0)                  # 4×84×84
+    return torch.tensor(state, dtype=torch.float32)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ELIXIR DETECTION  (OCR-free, template-match approach)
+#  Reads the elixir bar pixel width to estimate current elixir (0-10).
+#  You must calibrate ELIXIR_BAR_ROI to your window layout.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Relative bounding box of the elixir bar in the client area: (x1, y1, x2, y2)
+# These defaults assume a standard portrait BlueStacks layout — adjust as needed.
+ELIXIR_BAR_ROI  = (0.5498, 0.9625, 0.9788, 0.9883)   # calibrated via elixir_calibrate.py
+# Bright pink of the Clash Royale elixir fill
+ELIXIR_COLOR_LO = np.array([200,  50, 150], dtype=np.uint8)
+ELIXIR_COLOR_HI = np.array([255, 160, 255], dtype=np.uint8)
+
+
+def estimate_elixir(hwnd) -> float:
+    """
+    Estimate elixir (0.0–10.0) by measuring the fraction of the elixir bar
+    that is filled with the characteristic purple colour.
+
+    Falls back to 5.0 (safe mid-value) on failure.
+    """
+    try:
+        left, top, right, bottom = get_window_rect(hwnd)
+        w = right  - left
+        h = bottom - top
+        x1 = left + int(ELIXIR_BAR_ROI[0] * w)
+        y1 = top  + int(ELIXIR_BAR_ROI[1] * h)
+        x2 = left + int(ELIXIR_BAR_ROI[2] * w)
+        y2 = top  + int(ELIXIR_BAR_ROI[3] * h)
+        img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+        arr = np.array(img)
+        mask  = np.all((arr >= ELIXIR_COLOR_LO) & (arr <= ELIXIR_COLOR_HI), axis=2)
+        frac  = mask.sum() / max(mask.size, 1)
+        return round(min(max(frac * 10.0, 0.0), 10.0), 1)
+    except Exception:
+        return 5.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HAND DETECTION (template matching against card_refs/)
+#  Returns the 4 cards currently visible in the card bar.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Relative positions of the 4 card slots in the card bar (centre of each slot)
+CARD_SLOT_ROIS = {
+    1: (0.220, 0.870, 0.310, 0.940),
+    2: (0.355, 0.870, 0.445, 0.940),
+    3: (0.490, 0.870, 0.580, 0.940),
+    4: (0.625, 0.870, 0.715, 0.940),
+}
+
+_ref_cache: dict[str, np.ndarray] = {}
+
+def _load_refs() -> dict[str, np.ndarray]:
+    """Load and cache card reference images from card_refs/ (grayscale, 32×32).
+    Accepts .jpg, .jpeg, or .png — whichever exists first."""
+    global _ref_cache
+    if _ref_cache:
+        return _ref_cache
+    for key in CARD_KEYS:
+        found = None
+        for ext in (".jpg", ".jpeg", ".png"):
+            candidate = CARD_REF_DIR / f"{key}{ext}"
+            if candidate.exists():
+                found = candidate
+                break
+        if found:
+            img = cv2.imread(str(found), cv2.IMREAD_GRAYSCALE)
+            _ref_cache[key] = cv2.resize(img, (32, 32))
+            print(f"[Refs] Loaded: {found.name}")
+        else:
+            print(f"[WARN] Missing card ref for '{key}' (tried .jpg/.jpeg/.png)")
+    return _ref_cache
+
+
+def detect_hand(hwnd) -> list[str]:
+    """
+    Identify which cards are in each of the 4 hand slots via template matching.
+    Returns a list of up to 4 card keys.
+    If card_refs are missing, returns a random 4-card hand (for early testing).
+    """
+    refs = _load_refs()
+    if not refs:
+        # No reference images yet — return a random subset for smoke testing
+        return random.sample(CARD_KEYS, 4)
+
+    left, top, right, bottom = get_window_rect(hwnd)
+    w = right - left
+    h = bottom - top
+
+    hand = []
+    for slot_idx, roi in CARD_SLOT_ROIS.items():
+        x1 = left + int(roi[0] * w)
+        y1 = top  + int(roi[1] * h)
+        x2 = left + int(roi[2] * w)
+        y2 = top  + int(roi[3] * h)
+        slot_img = np.array(ImageGrab.grab(bbox=(x1, y1, x2, y2)))
+        slot_gray = cv2.cvtColor(slot_img, cv2.COLOR_RGB2GRAY)
+        slot_gray = cv2.resize(slot_gray, (32, 32))
+
+        best_key, best_score = None, -1.0
+        for key, ref in refs.items():
+            res   = cv2.matchTemplate(slot_gray, ref, cv2.TM_CCOEFF_NORMED)
+            score = float(res.max())
+            if score > best_score:
+                best_score, best_key = score, key
+
+        if best_key:
+            hand.append(best_key)
+
+    return hand
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REWARD FUNCTION
+#  Called at the end of each match; in-match shaping uses elixir efficiency.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_match_reward(won: bool) -> float:
+    """
+    Sparse terminal reward for a completed match.
+      +3.0  win
+      -1.0  loss
+    """
+    return 3.0 if won else -1.0
+
+
+def compute_step_reward(action_was_wait: bool, elixir_before: float,
+                        card_played: str | None) -> float:
+    """
+    Dense per-step shaping reward to reduce sparsity.
+      -0.01  for every WAIT when a playable card exists  (punish passivity)
+      +0.05  for playing a card (any action is better than nothing)
+      +0.10  bonus for playing a high-value card when elixir allows
+    """
+    if action_was_wait:
+        return -0.01
+    if card_played is None:
+        return 0.0
+    bonus = 0.05
+    if DECK[card_played]["elixir"] >= 4 and elixir_before >= DECK[card_played]["elixir"]:
+        bonus += 0.10   # reward committing high-elixir cards when affordable
+    return bonus
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REPLAY BUFFER
+# ══════════════════════════════════════════════════════════════════════════════
+
+Transition = collections.namedtuple(
+    "Transition", ["state", "action", "reward", "next_state", "done"]
+)
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 10_000):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.buffer.append(Transition(*args))
+
+    def sample(self, batch_size: int) -> list[Transition]:
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DQN MODEL
+#  Input : [4, 84, 84] (3 RGB + 1 elixir channel)
+#  Output: Q-values for each of the 73 actions
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DQN(nn.Module):
+    def __init__(self, n_actions: int = N_ACTIONS):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(4,  32, kernel_size=8, stride=4),  # → 32×20×20
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # → 64×9×9
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # → 64×7×7
+            nn.ReLU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.conv(x))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ClashRoyaleAgent:
+    # ── Hyperparameters ──────────────────────────────────────────────────────
+    GAMMA          = 0.99     # discount factor
+    LR             = 1e-4     # learning rate
+    BATCH_SIZE     = 32
+    BUFFER_SIZE    = 10_000
+    EPS_START      = 1.00     # ε-greedy exploration start
+    EPS_END        = 0.10
+    EPS_DECAY      = 0.995    # multiply ε by this after each match
+    TARGET_UPDATE  = 10       # sync target net every N matches
+    MIN_BUFFER     = 500      # don't train until buffer has this many samples
+    STEP_SLEEP     = 0.5      # seconds between decision steps (don't spam clicks)
+
+    def __init__(self, device: str = "cpu"):
+        self.device  = torch.device(device)
+        self.policy_net = DQN().to(self.device)
+        self.target_net = DQN().to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.LR)
+        self.buffer    = ReplayBuffer(self.BUFFER_SIZE)
+        self.epsilon   = self.EPS_START
+        self.match_num = 0
+        self.losses    = []
+
+        # CSV log
+        self.log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(self.log_path, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["match", "epsilon", "total_reward", "avg_loss", "won"]
+            )
+
+    # ── Action selection ─────────────────────────────────────────────────────
+
+    def select_action(self, state: torch.Tensor,
+                      hand: list[str], elixir: float) -> int:
+        """ε-greedy action selection restricted to valid actions only."""
+        valid = get_valid_actions(hand, elixir)
+
+        if random.random() < self.epsilon:
+            return random.choice(valid)                   # explore
+
+        with torch.no_grad():
+            q_vals = self.policy_net(state.unsqueeze(0).to(self.device))[0]
+        # Mask invalid actions with -inf before argmax
+        mask = torch.full((N_ACTIONS,), float("-inf"))
+        mask[valid] = q_vals[valid]
+        return int(mask.argmax().item())                  # exploit
+
+    # ── Training step ────────────────────────────────────────────────────────
+
+    def train_step(self) -> float | None:
+        if len(self.buffer) < self.MIN_BUFFER:
+            return None
+
+        batch      = self.buffer.sample(self.BATCH_SIZE)
+        states     = torch.stack([t.state      for t in batch]).to(self.device)
+        actions    = torch.tensor([t.action    for t in batch], dtype=torch.long).to(self.device)
+        rewards    = torch.tensor([t.reward    for t in batch], dtype=torch.float32).to(self.device)
+        next_states= torch.stack([t.next_state for t in batch]).to(self.device)
+        dones      = torch.tensor([t.done      for t in batch], dtype=torch.float32).to(self.device)
+
+        # Current Q
+        q_current = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Target Q (Double DQN style)
+        with torch.no_grad():
+            next_actions = self.policy_net(next_states).argmax(1)
+            q_next       = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            q_target     = rewards + self.GAMMA * q_next * (1 - dones)
+
+        loss = nn.functional.smooth_l1_loss(q_current, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+        self.optimizer.step()
+        return loss.item()
+
+    # ── Execute action in emulator ───────────────────────────────────────────
+
+    def execute_action(self, hwnd, action_idx: int, hand: list[str]):
+        """Translate action index → bluestacks_control calls."""
+        card_key, zone_key = decode_action(action_idx)
+
+        if card_key is None:
+            wait_action(hwnd)
+            return
+
+        # Map card_key to its slot in the current hand (1-indexed)
+        if card_key not in hand:
+            wait_action(hwnd)
+            return
+
+        slot = hand.index(card_key) + 1   # 1-4
+        place_card(hwnd, card_slot=slot, arena_zone=zone_key)
+
+    # ── Match loop ───────────────────────────────────────────────────────────
+
+    def run_match(self, hwnd) -> dict:
+        """
+        Run one full match, collecting transitions, executing actions,
+        and returning match summary stats.
+
+        The loop runs until you manually signal match end (see TODOs below).
+        """
+        print(f"\n{'='*60}")
+        print(f"  MATCH {self.match_num + 1}   ε={self.epsilon:.3f}")
+        print(f"{'='*60}\n")
+
+        total_reward = 0.0
+        step         = 0
+        match_losses = []
+        state        = None
+
+        # ── TODO: add your match-start detection here ──────────────────────
+        # e.g. wait for the "Battle" button on screen before entering the loop
+        # ───────────────────────────────────────────────────────────────────
+
+        while True:
+            # 1. Observe
+            img    = screenshot_window(hwnd)
+            elixir = estimate_elixir(hwnd)
+            hand   = detect_hand(hwnd)
+
+            print(f"[Step {step:03d}]  elixir={elixir:.1f}  hand={[DECK[k]['name'] for k in hand]}")
+
+            next_state = build_state_tensor(img, elixir)
+
+            # 2. Store previous transition
+            if state is not None:
+                step_r = compute_step_reward(
+                    action_was_wait=(last_action == WAIT_ACTION),
+                    elixir_before=last_elixir,
+                    card_played=last_card,
+                )
+                self.buffer.push(state, last_action, step_r, next_state, False)
+                total_reward += step_r
+
+                # Train
+                loss = self.train_step()
+                if loss is not None:
+                    match_losses.append(loss)
+
+            # 3. Select & execute action
+            action     = self.select_action(next_state, hand, elixir)
+            card_key, zone_key = decode_action(action)
+            self.execute_action(hwnd, action, hand)
+
+            last_action = action
+            last_elixir = elixir
+            last_card   = card_key
+            state        = next_state
+            step        += 1
+
+            time.sleep(self.STEP_SLEEP)
+
+            # ── Match end detection ───────────────────────────────────────
+            # Safety cap: a Clash Royale match can't exceed ~5 min = 600 steps
+            if step >= 600:
+                print("[Match] Step cap reached — forcing end.")
+                break
+            # Primary: detect end screen via colour signature
+            if is_end_screen(hwnd):
+                print("[Match] End screen detected mid-loop — breaking.")
+                break
+            # Secondary: if elixir bar disappears mid-match something changed
+            if step > 10 and not is_match_live(hwnd):
+                print("[Match] Elixir bar gone — match likely ended.")
+                break
+
+        # ── Terminal reward (real detection via match_lifecycle) ───────────
+        result     = handle_match_end(hwnd)   # clicks OK + Battle, waits for next match
+        won        = result["won"]
+
+        terminal_r = compute_match_reward(won)
+        print(f"[Match] Terminal reward: {terminal_r:.2f}  ({'VICTORY' if won else 'DEFEAT'})")
+        if state is not None:
+            dummy_next = torch.zeros_like(state)
+            self.buffer.push(state, last_action, terminal_r, dummy_next, True)
+        total_reward += terminal_r
+
+        # ── Post-match updates ─────────────────────────────────────────────
+        self.match_num += 1
+        self.epsilon    = max(self.EPS_END, self.epsilon * self.EPS_DECAY)
+
+        if self.match_num % self.TARGET_UPDATE == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+            print(f"[Agent] Target network synced at match {self.match_num}")
+
+        avg_loss = float(np.mean(match_losses)) if match_losses else 0.0
+
+        # Log
+        with open(self.log_path, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [self.match_num, f"{self.epsilon:.4f}",
+                 f"{total_reward:.3f}", f"{avg_loss:.5f}", int(won)]
+            )
+
+        # Checkpoint every 10 matches
+        if self.match_num % 10 == 0:
+            ckpt = CHECKPOINT_DIR / f"dqn_match_{self.match_num}.pt"
+            torch.save(self.policy_net.state_dict(), ckpt)
+            print(f"[Agent] Checkpoint saved → {ckpt}")
+
+        summary = {
+            "match":        self.match_num,
+            "steps":        step,
+            "total_reward": total_reward,
+            "avg_loss":     avg_loss,
+            "won":          won,
+            "epsilon":      self.epsilon,
+        }
+        print(f"\n[Summary] {summary}\n")
+        return summary
+
+    # ── Training loop ────────────────────────────────────────────────────────
+
+    def train(self, n_matches: int = 200):
+        hwnd = find_bluestacks_window()
+        focus_window(hwnd)
+
+        print("\n╔══════════════════════════════════════════╗")
+        print("║   Clash Bot Pro — DQN Training Started  ║")
+        print(f"║   Deck: {', '.join(CARD_KEYS[:4])}...")
+        print(f"║   Actions: {N_ACTIONS}  |  Matches: {n_matches}")
+        print("╚══════════════════════════════════════════╝\n")
+        print("⚠  Make sure a match is in progress before the loop starts!\n")
+        time.sleep(5)
+
+        results = []
+        for _ in range(n_matches):
+            summary = self.run_match(hwnd)
+            results.append(summary)
+            # match_lifecycle.handle_match_end() already navigates back to next match
+
+        print("\n✓ Training complete.")
+        return results
+
+
+def debug_calibrate():
+    """
+    Quick calibration check — run this instead of train() to verify:
+      1. Elixir is being read correctly
+      2. Card slots are being detected correctly
+    Saves annotated screenshots to clash_bot/screenshots/ so you can inspect them.
+    """
+    import cv2 as _cv2
+    hwnd = find_bluestacks_window()
+    focus_window(hwnd)
+    print("\n=== CALIBRATION DEBUG ===")
+    print("Reading elixir + hand for 5 steps. Check the saved screenshots.\n")
+
+    for i in range(5):
+        img    = screenshot_window(hwnd)
+        elixir = estimate_elixir(hwnd)
+        hand   = detect_hand(hwnd)
+
+        print(f"Step {i+1}: elixir={elixir}  hand={[DECK[k]['name'] for k in hand]}")
+
+        # Save annotated screenshot
+        arr = np.array(img)
+        bgr = _cv2.cvtColor(arr, _cv2.COLOR_RGB2BGR)
+
+        # Draw card slot boxes
+        left, top, right, bottom = get_window_rect(hwnd)
+        w = right - left
+        h = bottom - top
+        for slot, roi in CARD_SLOT_ROIS.items():
+            x1 = int(roi[0] * w); y1 = int(roi[1] * h)
+            x2 = int(roi[2] * w); y2 = int(roi[3] * h)
+            _cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            _cv2.putText(bgr, str(slot), (x1+2, y1+15),
+                         _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+        # Draw elixir bar box
+        ex1 = int(ELIXIR_BAR_ROI[0] * w); ey1 = int(ELIXIR_BAR_ROI[1] * h)
+        ex2 = int(ELIXIR_BAR_ROI[2] * w); ey2 = int(ELIXIR_BAR_ROI[3] * h)
+        _cv2.rectangle(bgr, (ex1, ey1), (ex2, ey2), (0, 0, 255), 2)
+        _cv2.putText(bgr, f"elixir={elixir}", (ex1, ey1-5),
+                     _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+        out_path = str(SCREENSHOT_DIR / f"debug_step_{i+1}.png")
+        _cv2.imwrite(out_path, bgr)
+        print(f"  → Saved: {out_path}")
+        time.sleep(1)
+
+    print("\n=== Check clash_bot/screenshots/ to verify the green boxes")
+    print("    land on the card slots and the red box covers the elixir bar ===\n")
+
+
+
+
+if __name__ == "__main__":
+    import sys
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Device] Using: {device}")
+
+    if "--debug" in sys.argv:
+        debug_calibrate()
+    else:
+        agent = ClashRoyaleAgent(device=device)
+        agent.train(n_matches=200)
