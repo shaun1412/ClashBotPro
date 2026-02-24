@@ -232,22 +232,22 @@ def estimate_elixir(hwnd) -> float:
 TIMER_ROI = (0.72, 0.02, 0.98, 0.09)
 
 
+# Clash Royale match length is 3 minutes
+TIMER_MIN_MAX = 3
+TIMER_SEC_MAX = 59
+
+
 def _parse_timer_ocr(crop_rgb: np.ndarray) -> tuple[int, int] | None:
-    """Parse "minute:seconds" from a small crop. Returns (minutes, seconds) or None."""
+    """Parse "minute:seconds" from a small crop. Returns (minutes, seconds) or None.
+    Validates: minutes in [0, TIMER_MIN_MAX], seconds in [0, TIMER_SEC_MAX]."""
     try:
         import pytesseract
     except ImportError:
         return None
-    try:
-        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY) if crop_rgb.ndim == 3 else np.asarray(crop_rgb)
-        if gray.dtype != np.uint8:
-            gray = (gray * 255).astype(np.uint8) if gray.max() <= 1.0 else gray.astype(np.uint8)
-        gray = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    def run_ocr(g: np.ndarray) -> tuple[int, int] | None:
         text = pytesseract.image_to_string(
-            gray, config="-c tessedit_char_whitelist=0123456789: --psm 7"
+            g, config="-c tessedit_char_whitelist=0123456789: --psm 7"
         ).strip()
-        # Expect "M:SS" or "MM:SS"
         parts = text.replace(" ", "").split(":")
         if len(parts) != 2:
             return None
@@ -255,11 +255,25 @@ def _parse_timer_ocr(crop_rgb: np.ndarray) -> tuple[int, int] | None:
         s_str = "".join(c for c in parts[1] if c.isdigit())
         if not m_str or not s_str:
             return None
-        minutes = int(m_str) if m_str else 0
-        seconds = int(s_str) if s_str else 0
+        minutes = int(m_str)
+        seconds = int(s_str)
         if seconds > 59:
-            seconds = seconds % 100  # e.g. 60 -> 0
-        return (minutes, seconds)
+            seconds = seconds % 60
+        if 0 <= minutes <= TIMER_MIN_MAX and 0 <= seconds <= TIMER_SEC_MAX:
+            return (minutes, seconds)
+        return None
+    try:
+        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY) if crop_rgb.ndim == 3 else np.asarray(crop_rgb)
+        if gray.dtype != np.uint8:
+            gray = (gray * 255).astype(np.uint8) if gray.max() <= 1.0 else gray.astype(np.uint8)
+        gray = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+        _, gray_bin = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        result = run_ocr(gray_bin)
+        if result is not None:
+            return result
+        # Try inverted (light text on dark bg)
+        result = run_ocr(255 - gray_bin)
+        return result
     except Exception:
         return None
 
@@ -296,11 +310,16 @@ CARD_SLOT_ROIS = {
     4: (0.625, 0.870, 0.715, 0.940),
 }
 
+# Only accept a card in a slot if template match score >= this (stops hallucination)
+HAND_DETECT_THRESH = 0.48
+# Ref size for matching (larger = more detail, less blur)
+HAND_REF_SIZE = 64
+
 _ref_cache: dict[str, np.ndarray] = {}
 _ref_load_attempted: bool = False  # so we only print missing warnings once
 
 def _load_refs() -> dict[str, np.ndarray]:
-    """Load and cache card reference images from card_refs/ (grayscale, 32×32).
+    """Load and cache card reference images from card_refs/ (grayscale, HAND_REF_SIZE×HAND_REF_SIZE).
     Accepts .jpg, .jpeg, or .png — whichever exists first. Missing refs warned once."""
     global _ref_cache, _ref_load_attempted
     if _ref_load_attempted:
@@ -317,7 +336,7 @@ def _load_refs() -> dict[str, np.ndarray]:
         if found:
             img = cv2.imread(str(found), cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                _ref_cache[key] = cv2.resize(img, (32, 32))
+                _ref_cache[key] = cv2.resize(img, (HAND_REF_SIZE, HAND_REF_SIZE))
                 print(f"[Refs] Loaded: {found.name}")
             else:
                 missing.append(key)
@@ -326,20 +345,19 @@ def _load_refs() -> dict[str, np.ndarray]:
     if missing:
         print(f"[Refs] Missing card refs for: {missing}")
         print(f"       Add images to {CARD_REF_DIR.absolute()} as e.g. pekka.png, zap.jpg")
-        print(f"       Hand detection will use random cards until refs are added.\n")
+        print(f"       See ROBUSTNESS.md for how to capture good refs. Until then only WAIT is valid.\n")
     return _ref_cache
 
 
 def detect_hand(hwnd) -> list[str]:
     """
     Identify which cards are in each of the 4 hand slots via template matching.
-    Returns a list of up to 4 card keys.
-    If card_refs are missing, returns a random 4-card hand (for early testing).
+    Only reports a card if match score >= HAND_DETECT_THRESH (avoids hallucination).
+    Returns a list of 0–4 card keys (order = slot 1–4). Empty if no refs or all low-confidence.
     """
     refs = _load_refs()
     if not refs:
-        # No reference images yet — return a random subset for smoke testing
-        return random.sample(CARD_KEYS, 4)
+        return []  # no guessing: only WAIT will be valid
 
     left, top, right, bottom = get_window_rect(hwnd)
     w = right - left
@@ -353,7 +371,7 @@ def detect_hand(hwnd) -> list[str]:
         y2 = top  + int(roi[3] * h)
         slot_img = np.array(ImageGrab.grab(bbox=(x1, y1, x2, y2)))
         slot_gray = cv2.cvtColor(slot_img, cv2.COLOR_RGB2GRAY)
-        slot_gray = cv2.resize(slot_gray, (32, 32))
+        slot_gray = cv2.resize(slot_gray, (HAND_REF_SIZE, HAND_REF_SIZE))
 
         best_key, best_score = None, -1.0
         for key, ref in refs.items():
@@ -362,7 +380,7 @@ def detect_hand(hwnd) -> list[str]:
             if score > best_score:
                 best_score, best_key = score, key
 
-        if best_key:
+        if best_key and best_score >= HAND_DETECT_THRESH:
             hand.append(best_key)
 
     return hand
