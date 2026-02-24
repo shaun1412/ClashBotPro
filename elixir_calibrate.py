@@ -1,7 +1,7 @@
 """
 elixir_calibrate.py
 -------------------
-Interactive calibration tool. Takes a screenshot of BlueStacks, then
+Interactive calibration tool. Takes a screenshot of MuMu Player, then
 lets you CLICK the top-left and bottom-right corners of the elixir bar.
 Automatically calculates the correct ROI fractions and patches rl_agent.py.
 
@@ -18,17 +18,18 @@ import win32con
 import numpy as np
 from pathlib import Path
 
-# ── Find BlueStacks & grab screenshot ────────────────────────────────────────
+# ── Find MuMu Player & grab screenshot ─────────────────────────────────────
 
-def find_bluestacks():
+def find_mumu():
     found = []
     def cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
-            if "bluestacks" in win32gui.GetWindowText(hwnd).lower():
+            t = win32gui.GetWindowText(hwnd).lower()
+            if "mumu" in t or "nemu" in t:
                 found.append(hwnd)
     win32gui.EnumWindows(cb, None)
     if not found:
-        raise RuntimeError("BlueStacks not found! Is it running?")
+        raise RuntimeError("MuMu Player not found! Is it running?")
     return found[0]
 
 def get_client_rect(hwnd):
@@ -222,14 +223,14 @@ class CalibrationTool:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Finding BlueStacks and taking screenshot...")
+    print("Finding MuMu Player and taking screenshot...")
     print("Make sure a match is running so the elixir bar is visible.\n")
     time.sleep(1)
 
-    hwnd = find_bluestacks()
+    hwnd = find_mumu()
     img, rect = grab_screenshot(hwnd)
 
-    # Minimise BlueStacks so calibration window is visible
+    # Minimise MuMu so calibration window is visible
     # (don't close it, we still need the screenshot)
 
     print("Screenshot captured! Opening calibration window...\n")

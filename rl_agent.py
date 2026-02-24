@@ -2,7 +2,7 @@
 rl_agent.py
 -----------
 Script 2: DQN-based RL agent for Clash Royale.
-Integrates with bluestacks_control.py for action execution.
+Uses mumu_control.py for emulator (MuMu Player) control and action execution.
 
 Deck: PEKKA · Battle Ram · Bandit · Royal Ghost · E-Spirit · Zap · Arrows · Wizard
 
@@ -38,8 +38,8 @@ import torch.optim as optim
 from PIL import ImageGrab, Image
 
 # ── local import ──────────────────────────────────────────────────────────────
-from bluestacks_control import (
-    find_bluestacks_window,
+from mumu_control import (
+    find_mumu_window,
     focus_window,
     get_window_rect,
     screenshot_window,
@@ -71,7 +71,7 @@ for d in [CARD_REF_DIR, SCREENSHOT_DIR, CHECKPOINT_DIR, LOG_DIR]:
 #  DECK DEFINITION
 #  Each card: internal key → { display name, elixir cost, slot index (0-3) }
 #  The agent always sees 4 cards in hand; slot index maps to card_slot 1-4
-#  in bluestacks_control.place_card().
+#  in mumu_control.place_card().
 # ══════════════════════════════════════════════════════════════════════════════
 
 DECK = {
@@ -94,7 +94,7 @@ N_CARDS   = len(CARD_KEYS)      # 8
 #  Total: 8 cards × 9 zones + 1 = 73 actions
 # ══════════════════════════════════════════════════════════════════════════════
 
-ZONE_KEYS   = list(ARENA_ZONES.keys())   # 9 zones from bluestacks_control
+ZONE_KEYS   = list(ARENA_ZONES.keys())   # 9 zones from mumu_control
 N_ZONES     = len(ZONE_KEYS)             # 9
 WAIT_ACTION = N_CARDS * N_ZONES          # index 72 → do nothing
 N_ACTIONS   = N_CARDS * N_ZONES + 1     # 73
@@ -162,7 +162,7 @@ def build_state_tensor(img: Image.Image, elixir: float) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Relative bounding box of the elixir bar in the client area: (x1, y1, x2, y2)
-# These defaults assume a standard portrait BlueStacks layout — adjust as needed.
+# Defaults assume a standard portrait MuMu/game layout — calibrate with elixir_calibrate.py if needed.
 ELIXIR_BAR_ROI  = (0.5498, 0.9625, 0.9788, 0.9883)   # calibrated via elixir_calibrate.py
 # Bright pink of the Clash Royale elixir fill
 ELIXIR_COLOR_LO = np.array([200,  50, 150], dtype=np.uint8)
@@ -436,7 +436,7 @@ class ClashRoyaleAgent:
     # ── Execute action in emulator ───────────────────────────────────────────
 
     def execute_action(self, hwnd, action_idx: int, hand: list[str]):
-        """Translate action index → bluestacks_control calls."""
+        """Translate action index → mumu_control calls."""
         card_key, zone_key = decode_action(action_idx)
 
         if card_key is None:
@@ -582,7 +582,7 @@ class ClashRoyaleAgent:
           5. Waits for the next match to start, then repeats from step 3.
         Repeats until n_matches is reached.
         """
-        hwnd = find_bluestacks_window()
+        hwnd = find_mumu_window()
         focus_window(hwnd)
 
         print("\n╔══════════════════════════════════════════╗")
@@ -618,7 +618,7 @@ def debug_calibrate():
     Saves annotated screenshots to clash_bot/screenshots/ so you can inspect them.
     """
     import cv2 as _cv2
-    hwnd = find_bluestacks_window()
+    hwnd = find_mumu_window()
     focus_window(hwnd)
     print("\n=== CALIBRATION DEBUG ===")
     print("Reading elixir + hand for 5 steps. Check the saved screenshots.\n")

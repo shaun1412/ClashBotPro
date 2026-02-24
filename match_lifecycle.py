@@ -42,7 +42,7 @@ def get_client_rect(hwnd):
 
 
 def grab_full(hwnd) -> np.ndarray:
-    """Capture the BlueStacks client area as an RGB numpy array."""
+    """Capture the emulator (MuMu) client area as an RGB numpy array."""
     left, top, right, bottom = get_client_rect(hwnd)
     return np.array(ImageGrab.grab(bbox=(left, top, right, bottom)))
 
@@ -65,7 +65,7 @@ def color_frac(region: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> float:
 
 
 def click_rel(hwnd, rel_x: float, rel_y: float, delay: float = 0.2):
-    """Click at a fractional position within the BlueStacks client area."""
+    """Click at a fractional position within the emulator (MuMu) client area."""
     left, top, right, bottom = get_client_rect(hwnd)
     w, h = right - left, bottom - top
     pyautogui.click(left + int(rel_x * w), top + int(rel_y * h))
@@ -111,11 +111,12 @@ OK_LO     = np.array([ 30,  60, 160], dtype=np.uint8)
 OK_HI     = np.array([120, 160, 255], dtype=np.uint8)
 OK_THRESH = 0.06
 
-# Battle / Play Again button — green, main lobby
-BATTLE_ROI    = (0.20, 0.72, 0.80, 0.90)
-BATTLE_LO     = np.array([ 40, 150,  30], dtype=np.uint8)
-BATTLE_HI     = np.array([130, 255, 120], dtype=np.uint8)
-BATTLE_THRESH = 0.06
+# Battle / Play Again button — green, main lobby (ROI widened so we don't miss it)
+BATTLE_ROI    = (0.15, 0.65, 0.85, 0.95)
+BATTLE_LO     = np.array([ 25, 120,  20], dtype=np.uint8)   # looser green range
+BATTLE_HI     = np.array([150, 255, 140], dtype=np.uint8)
+BATTLE_THRESH = 0.05
+BATTLE_TEMPLATE_THRESH = 0.58   # template match threshold (approximate match)
 
 # Elixir bar — pink, ONLY visible during a live match
 ELIXIR_ROI    = (0.5498, 0.9625, 0.9788, 0.9883)   # calibrated
@@ -124,8 +125,8 @@ ELIXIR_HI     = np.array([255, 160, 255], dtype=np.uint8)
 ELIXIR_THRESH = 0.05
 
 # Winner ref images (optional but recommended — use your screenshots for reliable detection)
-WINNER_REF_BLUE = REF_DIR / "winner_blue.png"   # crop of "Winner!" when agent wins (blue)
-WINNER_REF_PINK = REF_DIR / "winner_pink.png"   # crop of "Winner!" when opponent wins (pink)
+WINNER_REF_BLUE = REF_DIR / "winner_blue.jpeg"   # crop of "Winner!" when agent wins (blue)
+WINNER_REF_PINK = REF_DIR / "winner_pink.jpeg"   # crop of "Winner!" when opponent wins (pink)
 WINNER_REF_THRESH = 0.60   # min template match score to consider "end screen" / win or loss
 WINNER_REF_SCALES = (0.5, 0.7, 0.9, 1.1, 1.3)  # multi-scale matching for different resolutions
 # ROI to crop when capturing winner refs (banner usually in upper-center): x1, y1, x2, y2 frac
@@ -296,6 +297,48 @@ def _template_score(arr: np.ndarray, ref_path: Path, roi: tuple) -> float:
     return float(cv2.matchTemplate(gray, ref_r, cv2.TM_CCOEFF_NORMED).max())
 
 
+def _find_battle_template_click(arr: np.ndarray) -> tuple[float, float] | None:
+    """
+    Search the bottom half of the screen for the Battle button template.
+    Returns (rel_x, rel_y) to click (0–1) or None if no good match.
+    """
+    ref_path = REF_DIR / "battle_button.png"
+    if not ref_path.exists():
+        return None
+    ref = cv2.imread(str(ref_path), cv2.IMREAD_GRAYSCALE)
+    if ref is None:
+        return None
+    h, w = arr.shape[:2]
+    # Search bottom 50% of screen (Battle is always in lower part)
+    search = crop(arr, (0.0, 0.50, 1.0, 1.0))
+    gray = cv2.cvtColor(search, cv2.COLOR_RGB2GRAY)
+    sh, sw = gray.shape[:2]
+    ref_h, ref_w = ref.shape[:2]
+    best_val, best_x, best_y = 0.0, 0, 0
+    for scale in (0.6, 0.8, 1.0, 1.2):
+        tw = max(10, min(int(ref_w * scale), sw - 5))
+        th = max(10, min(int(ref_h * scale), sh - 5))
+        if tw > sw or th > sh:
+            continue
+        ref_scaled = cv2.resize(ref, (tw, th))
+        try:
+            result = cv2.matchTemplate(gray, ref_scaled, cv2.TM_CCOEFF_NORMED)
+            val = float(result.max())
+            if val > best_val:
+                best_val = val
+                idx = np.unravel_index(np.argmax(result), result.shape)
+                best_y = idx[0] + th // 2
+                best_x = idx[1] + tw // 2
+        except cv2.error:
+            pass
+    if best_val < BATTLE_TEMPLATE_THRESH:
+        return None
+    # Convert to full-screen relative coords (search is bottom half: y from 0.5 to 1.0)
+    rel_x = best_x / w
+    rel_y = 0.50 + (best_y / h)
+    return (rel_x, rel_y)
+
+
 def click_ok(hwnd, timeout: float = 12.0) -> bool:
     """Wait for and click the OK / Continue button. Returns True if clicked."""
     print("[Lifecycle] Waiting for OK button...")
@@ -318,10 +361,21 @@ def click_battle(hwnd, timeout: float = 25.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         arr = grab_full(hwnd)
-        if (color_frac(crop(arr, BATTLE_ROI), BATTLE_LO, BATTLE_HI) >= BATTLE_THRESH or
-                _template_score(arr, REF_DIR / "battle_button.png", BATTLE_ROI) > 0.70):
+        # 1) Color in fixed ROI
+        if color_frac(crop(arr, BATTLE_ROI), BATTLE_LO, BATTLE_HI) >= BATTLE_THRESH:
             click_roi_centre(hwnd, BATTLE_ROI)
-            print("[Lifecycle] Battle clicked.")
+            print("[Lifecycle] Battle clicked (color).")
+            return True
+        # 2) Template in fixed ROI
+        if _template_score(arr, REF_DIR / "battle_button.png", BATTLE_ROI) > BATTLE_TEMPLATE_THRESH:
+            click_roi_centre(hwnd, BATTLE_ROI)
+            print("[Lifecycle] Battle clicked (template ROI).")
+            return True
+        # 3) Search bottom half of screen for template (button may be off-center)
+        pos = _find_battle_template_click(arr)
+        if pos is not None:
+            click_rel(hwnd, pos[0], pos[1])
+            print("[Lifecycle] Battle clicked (template search).")
             return True
         time.sleep(0.3)
     print("[Lifecycle] WARN: Battle button not found within timeout.")
@@ -424,20 +478,21 @@ def capture_refs(hwnd, include_winner: bool = False):
 #  STANDALONE USAGE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _find_bluestacks():
+def _find_mumu():
     found = []
     def cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
-            if "bluestacks" in win32gui.GetWindowText(hwnd).lower():
+            t = win32gui.GetWindowText(hwnd).lower()
+            if "mumu" in t or "nemu" in t:
                 found.append(hwnd)
     win32gui.EnumWindows(cb, None)
     if not found:
-        raise RuntimeError("BlueStacks not found!")
+        raise RuntimeError("MuMu Player not found! Is it running?")
     return found[0]
 
 
 if __name__ == "__main__":
-    hwnd = _find_bluestacks()
+    hwnd = _find_mumu()
 
     if "--capture" in sys.argv:
         capture_refs(hwnd, include_winner="--winner" in sys.argv)
