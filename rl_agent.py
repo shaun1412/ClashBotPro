@@ -6,14 +6,11 @@ Uses mumu_control.py for emulator (MuMu Player) control and action execution.
 
 Deck: PEKKA · Battle Ram · Bandit · Royal Ghost · E-Spirit · Zap · Arrows · Wizard
 
-Folder structure expected (run setup_folders.py to create automatically):
-    clash_bot/
-    ├── card_refs/          ← one reference PNG per card (for card detection)
-    │     pekka.png, battle_ram.png, bandit.png, royal_ghost.png,
-    │     e_spirit.png, zap.png, arrows.png, wizard.png
-    ├── screenshots/        ← saved raw game screenshots (optional debug)
-    ├── checkpoints/        ← model weights saved during training
-    └── logs/               ← reward / loss CSV logs
+Optional folders (created only when needed):
+    clash_bot/card_refs/     — card reference images for hand detection
+    clash_bot/logs/          — CSV training logs (created when training)
+    clash_bot/checkpoints/   — model checkpoints (created when saving)
+    clash_bot/screenshots/   — debug screenshots (only with --debug)
 
 Requirements:
     pip install torch torchvision opencv-python pywin32 pyautogui pillow numpy
@@ -22,7 +19,6 @@ Run:
     python rl_agent.py
 """
 
-import os
 import csv
 import time
 import random
@@ -63,9 +59,6 @@ CARD_REF_DIR    = BASE_DIR / "card_refs"
 SCREENSHOT_DIR  = BASE_DIR / "screenshots"
 CHECKPOINT_DIR  = BASE_DIR / "checkpoints"
 LOG_DIR         = BASE_DIR / "logs"
-
-for d in [CARD_REF_DIR, SCREENSHOT_DIR, CHECKPOINT_DIR, LOG_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DECK DEFINITION
@@ -378,10 +371,10 @@ class ClashRoyaleAgent:
         self.buffer    = ReplayBuffer(self.BUFFER_SIZE)
         self.epsilon   = self.EPS_START
         self.match_num = 0
-        self.losses    = []
 
-        # CSV log
+        # CSV log (create dir only when first needed)
         self.log_path = LOG_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "w", newline="") as f:
             csv.writer(f).writerow(
                 ["match", "epsilon", "total_reward", "avg_loss", "won"]
@@ -555,6 +548,7 @@ class ClashRoyaleAgent:
 
         # Checkpoint every 10 matches
         if self.match_num % 10 == 0:
+            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
             ckpt = CHECKPOINT_DIR / f"dqn_match_{self.match_num}.pt"
             torch.save(self.policy_net.state_dict(), ckpt)
             print(f"[Agent] Checkpoint saved → {ckpt}")
@@ -652,6 +646,7 @@ def debug_calibrate():
         _cv2.putText(bgr, f"elixir={elixir}", (ex1, ey1-5),
                      _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
 
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         out_path = str(SCREENSHOT_DIR / f"debug_step_{i+1}.png")
         _cv2.imwrite(out_path, bgr)
         print(f"  → Saved: {out_path}")

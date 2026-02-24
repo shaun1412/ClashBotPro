@@ -29,7 +29,6 @@ import win32gui
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REF_DIR = Path("clash_bot/lifecycle_refs")
-REF_DIR.mkdir(parents=True, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOW-LEVEL HELPERS
@@ -455,6 +454,7 @@ def handle_match_end(hwnd,
 
 def capture_refs(hwnd, include_winner: bool = False):
     """Save refs for OK, Battle, and optionally Winner (blue/pink) screens."""
+    REF_DIR.mkdir(parents=True, exist_ok=True)
     for name, roi in [("ok_button", OK_ROI), ("battle_button", BATTLE_ROI)]:
         input(f"\n[Capture] Show '{name}' on screen then press ENTER...")
         arr    = grab_full(hwnd)
@@ -479,15 +479,15 @@ def capture_refs(hwnd, include_winner: bool = False):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _find_mumu():
+    """Find emulator window by title (Android Device)."""
+    target = "android device"
     found = []
     def cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            t = win32gui.GetWindowText(hwnd).lower()
-            if "mumu" in t or "nemu" in t:
-                found.append(hwnd)
+        if win32gui.IsWindowVisible(hwnd) and target in win32gui.GetWindowText(hwnd).lower():
+            found.append(hwnd)
     win32gui.EnumWindows(cb, None)
     if not found:
-        raise RuntimeError("MuMu Player not found! Is it running?")
+        raise RuntimeError("Window titled 'Android Device' not found. Is the emulator running?")
     return found[0]
 
 

@@ -22,11 +22,8 @@ from PIL import ImageGrab
 # CONFIG — tweak to match your MuMu Player window
 # ──────────────────────────────────────────────
 
-# Window title substring (case-insensitive). MuMu Player typically has "MuMu" or "Nemu" in the title.
-MUMU_TITLE_SUBSTRING = "MuMu"
-
-# Fallback if your MuMu version uses Nemu in the title
-MUMU_TITLE_FALLBACK = "Nemu"
+# Window title (case-insensitive). Set to the emulator/game window title.
+ANDROID_WINDOW_TITLE = "Android Device"
 
 TAP_DURATION = 0.05
 ACTION_DELAY = 0.15
@@ -35,34 +32,27 @@ ACTION_DELAY = 0.15
 # WINDOW UTILITIES
 # ──────────────────────────────────────────────
 
-def find_mumu_window(
-    title_substring: str | None = None,
-    fallback_substring: str | None = MUMU_TITLE_FALLBACK,
-):
+def find_mumu_window(title_substring: str | None = None):
     """
     Return HWND of the first visible window whose title contains the substring
-    (default: "MuMu", then "Nemu" if none found). Raises RuntimeError if not found.
+    (default: "Android Device"). Raises RuntimeError if not found.
     """
-    primary = title_substring or MUMU_TITLE_SUBSTRING
+    search = (title_substring or ANDROID_WINDOW_TITLE).lower()
     found = []
 
     def enum_callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            t = title.lower()
-            if primary.lower() in t or (fallback_substring and fallback_substring.lower() in t):
-                found.append((hwnd, title))
+            if search in win32gui.GetWindowText(hwnd).lower():
+                found.append(hwnd)
 
     win32gui.EnumWindows(enum_callback, None)
-
     if not found:
         raise RuntimeError(
-            f"No visible window with '{primary}' or '{fallback_substring}' in title. "
-            "Is MuMu Player running?"
+            f"No visible window with '{search}' in title. Is the emulator running?"
         )
 
-    hwnd, title = found[0]
-    print(f"[Window] Found: '{title}'  (HWND={hwnd})")
+    hwnd = found[0]
+    print(f"[Window] Found: '{win32gui.GetWindowText(hwnd)}'  (HWND={hwnd})")
     return hwnd
 
 
@@ -77,7 +67,7 @@ def get_window_rect(hwnd) -> tuple[int, int, int, int]:
 
 
 def focus_window(hwnd):
-    """Bring the MuMu Player window to the foreground."""
+    """Bring the emulator window to the foreground."""
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     win32gui.SetForegroundWindow(hwnd)
@@ -85,7 +75,7 @@ def focus_window(hwnd):
 
 
 def screenshot_window(hwnd) -> "PIL.Image.Image":
-    """Capture the MuMu client area and return a PIL Image."""
+    """Capture the emulator client area and return a PIL Image."""
     left, top, right, bottom = get_window_rect(hwnd)
     return ImageGrab.grab(bbox=(left, top, right, bottom))
 
@@ -164,13 +154,10 @@ def wait_action(hwnd):
 # ──────────────────────────────────────────────
 
 def demo():
-    """Smoke test: find MuMu, screenshot, place one card."""
-    print("=== MuMu Control — Smoke Test ===\n")
+    """Smoke test: find window, focus, place one card."""
+    print("=== Emulator Control — Smoke Test ===\n")
     hwnd = find_mumu_window()
     focus_window(hwnd)
-    img = screenshot_window(hwnd)
-    img.save("mumu_screenshot.png")
-    print("[Screenshot] Saved to mumu_screenshot.png\n")
     print("Starting card placement in 3 seconds ...")
     time.sleep(3)
     place_card(hwnd, card_slot=1, arena_zone="center_mid")

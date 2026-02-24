@@ -1,7 +1,7 @@
 """
 elixir_calibrate.py
 -------------------
-Interactive calibration tool. Takes a screenshot of MuMu Player, then
+Interactive calibration tool. Takes a screenshot of the emulator (Android Device window), then
 lets you CLICK the top-left and bottom-right corners of the elixir bar.
 Automatically calculates the correct ROI fractions and patches rl_agent.py.
 
@@ -14,22 +14,21 @@ import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk, ImageDraw
 import win32gui
-import win32con
 import numpy as np
 from pathlib import Path
 
 # ── Find MuMu Player & grab screenshot ─────────────────────────────────────
 
-def find_mumu():
+def find_emulator_window():
+    """Find window titled 'Android Device' (emulator/game window)."""
+    target = "android device"
     found = []
     def cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            t = win32gui.GetWindowText(hwnd).lower()
-            if "mumu" in t or "nemu" in t:
-                found.append(hwnd)
+        if win32gui.IsWindowVisible(hwnd) and target in win32gui.GetWindowText(hwnd).lower():
+            found.append(hwnd)
     win32gui.EnumWindows(cb, None)
     if not found:
-        raise RuntimeError("MuMu Player not found! Is it running?")
+        raise RuntimeError("Window titled 'Android Device' not found. Is the emulator running?")
     return found[0]
 
 def get_client_rect(hwnd):
@@ -205,8 +204,7 @@ class CalibrationTool:
         preview = self.img.copy()
         draw    = ImageDraw.Draw(preview)
         draw.rectangle([lx, ty, rx, by], outline=(255, 165, 0), width=3)
-        out = Path("clash_bot/screenshots/elixir_roi_calibrated.png")
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = Path("elixir_roi_calibrated.png")
         preview.save(out)
         print(f"[✓] Preview saved → {out}")
 
@@ -223,14 +221,14 @@ class CalibrationTool:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Finding MuMu Player and taking screenshot...")
+    print("Finding emulator window (Android Device) and taking screenshot...")
     print("Make sure a match is running so the elixir bar is visible.\n")
     time.sleep(1)
 
-    hwnd = find_mumu()
+    hwnd = find_emulator_window()
     img, rect = grab_screenshot(hwnd)
 
-    # Minimise MuMu so calibration window is visible
+    # Minimise emulator so calibration window is visible
     # (don't close it, we still need the screenshot)
 
     print("Screenshot captured! Opening calibration window...\n")
