@@ -47,6 +47,7 @@ from mumu_control import (
 )
 from match_lifecycle import (
     is_match_live,
+    is_match_live_confirmed,
     is_end_screen,
     wait_for_match_start,
     handle_match_end,
@@ -224,6 +225,65 @@ def estimate_elixir(hwnd) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  MATCH TIMER (top-right, format "minute:seconds")
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ROI for the timer in the top-right: (x1, y1, x2, y2) as fraction of client area
+TIMER_ROI = (0.72, 0.02, 0.98, 0.09)
+
+
+def _parse_timer_ocr(crop_rgb: np.ndarray) -> tuple[int, int] | None:
+    """Parse "minute:seconds" from a small crop. Returns (minutes, seconds) or None."""
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+    try:
+        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY) if crop_rgb.ndim == 3 else np.asarray(crop_rgb)
+        if gray.dtype != np.uint8:
+            gray = (gray * 255).astype(np.uint8) if gray.max() <= 1.0 else gray.astype(np.uint8)
+        gray = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        text = pytesseract.image_to_string(
+            gray, config="-c tessedit_char_whitelist=0123456789: --psm 7"
+        ).strip()
+        # Expect "M:SS" or "MM:SS"
+        parts = text.replace(" ", "").split(":")
+        if len(parts) != 2:
+            return None
+        m_str = "".join(c for c in parts[0] if c.isdigit())
+        s_str = "".join(c for c in parts[1] if c.isdigit())
+        if not m_str or not s_str:
+            return None
+        minutes = int(m_str) if m_str else 0
+        seconds = int(s_str) if s_str else 0
+        if seconds > 59:
+            seconds = seconds % 100  # e.g. 60 -> 0
+        return (minutes, seconds)
+    except Exception:
+        return None
+
+
+def get_match_timer(hwnd) -> tuple[int, int] | None:
+    """
+    Read the match timer from the top-right (format "minute:seconds").
+    Returns (minutes, seconds) remaining, or None if unreadable.
+    """
+    try:
+        left, top, right, bottom = get_window_rect(hwnd)
+        w, h = right - left, bottom - top
+        x1 = left + int(TIMER_ROI[0] * w)
+        y1 = top  + int(TIMER_ROI[1] * h)
+        x2 = left + int(TIMER_ROI[2] * w)
+        y2 = top  + int(TIMER_ROI[3] * h)
+        img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+        arr = np.array(img)
+        return _parse_timer_ocr(arr)
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HAND DETECTION (template matching against card_refs/)
 #  Returns the 4 cards currently visible in the card bar.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -237,13 +297,16 @@ CARD_SLOT_ROIS = {
 }
 
 _ref_cache: dict[str, np.ndarray] = {}
+_ref_load_attempted: bool = False  # so we only print missing warnings once
 
 def _load_refs() -> dict[str, np.ndarray]:
     """Load and cache card reference images from card_refs/ (grayscale, 32×32).
-    Accepts .jpg, .jpeg, or .png — whichever exists first."""
-    global _ref_cache
-    if _ref_cache:
+    Accepts .jpg, .jpeg, or .png — whichever exists first. Missing refs warned once."""
+    global _ref_cache, _ref_load_attempted
+    if _ref_load_attempted:
         return _ref_cache
+    _ref_load_attempted = True
+    missing = []
     for key in CARD_KEYS:
         found = None
         for ext in (".jpg", ".jpeg", ".png"):
@@ -253,10 +316,17 @@ def _load_refs() -> dict[str, np.ndarray]:
                 break
         if found:
             img = cv2.imread(str(found), cv2.IMREAD_GRAYSCALE)
-            _ref_cache[key] = cv2.resize(img, (32, 32))
-            print(f"[Refs] Loaded: {found.name}")
+            if img is not None:
+                _ref_cache[key] = cv2.resize(img, (32, 32))
+                print(f"[Refs] Loaded: {found.name}")
+            else:
+                missing.append(key)
         else:
-            print(f"[WARN] Missing card ref for '{key}' (tried .jpg/.jpeg/.png)")
+            missing.append(key)
+    if missing:
+        print(f"[Refs] Missing card refs for: {missing}")
+        print(f"       Add images to {CARD_REF_DIR.absolute()} as e.g. pekka.png, zap.jpg")
+        print(f"       Hand detection will use random cards until refs are added.\n")
     return _ref_cache
 
 
@@ -328,6 +398,35 @@ def compute_step_reward(action_was_wait: bool, elixir_before: float,
     if DECK[card_played]["elixir"] >= 4 and elixir_before >= DECK[card_played]["elixir"]:
         bonus += 0.10   # reward committing high-elixir cards when affordable
     return bonus
+
+
+def _print_training_summary(results: list[dict]) -> None:
+    """Print learning summary and what to look for. Called after training completes."""
+    if not results:
+        return
+    n = len(results)
+    wins = sum(1 for r in results if r.get("won"))
+    win_rate = 100.0 * wins / n
+    last = min(20, n)
+    recent_wins = sum(1 for r in results[-last:] if r.get("won"))
+    recent_win_rate = 100.0 * recent_wins / last if last else 0
+    losses = [r.get("avg_loss", 0) for r in results if r.get("avg_loss") is not None]
+    avg_loss = float(np.mean(losses)) if losses else 0.0
+    recent_losses = [r.get("avg_loss", 0) for r in results[-last:] if r.get("avg_loss") is not None]
+    recent_avg_loss = float(np.mean(recent_losses)) if recent_losses else 0.0
+
+    print("\n" + "=" * 50)
+    print("  LEARNING SUMMARY")
+    print("=" * 50)
+    print(f"  Matches:     {n}")
+    print(f"  Win rate:    {win_rate:.1f}%  (recent {last}: {recent_win_rate:.1f}%)")
+    print(f"  Avg loss:    {avg_loss:.5f}  (recent {last}: {recent_avg_loss:.5f})")
+    print("=" * 50)
+    print("  What to look for:")
+    print("  - Loss:  Should trend down over time (recent < early).")
+    print("  - Wins:  Win rate may rise as policy improves (recent > early).")
+    print("  - Logs:  CSV in clash_bot/logs/ — plot with: python rl_agent.py --plot")
+    print("=" * 50 + "\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -508,8 +607,10 @@ class ClashRoyaleAgent:
             img    = screenshot_window(hwnd)
             elixir = estimate_elixir(hwnd)
             hand   = detect_hand(hwnd)
+            timer  = get_match_timer(hwnd)  # (minutes, seconds) top-right, or None
 
-            print(f"[Step {step:03d}]  elixir={elixir:.1f}  hand={[DECK[k]['name'] for k in hand]}")
+            timer_str = f"{timer[0]}:{timer[1]:02d}" if timer else "?"
+            print(f"[Step {step:03d}]  elixir={elixir:.1f}  time={timer_str}  hand={[DECK[k]['name'] for k in hand]}")
 
             next_state = build_state_tensor(img, elixir)
 
@@ -548,11 +649,15 @@ class ClashRoyaleAgent:
                 break
             if step < MIN_STEPS_BEFORE_END:
                 continue
+            if timer is not None and timer[0] == 0 and timer[1] == 0:
+                print("[Match] Timer 0:00 — match time expired.")
+                break
             if is_end_screen(hwnd):
                 print("[Match] End screen detected mid-loop — breaking.")
                 break
-            if not is_match_live(hwnd):
-                print("[Match] Elixir bar gone — match likely ended.")
+            # Only end on "elixir gone" after several consecutive misses (avoids one bad frame)
+            if not is_match_live(hwnd) and not is_match_live_confirmed(hwnd):
+                print("[Match] Elixir bar gone (confirmed) — match ended.")
                 break
 
         # ── Terminal reward (real detection via match_lifecycle) ───────────
@@ -638,6 +743,7 @@ class ClashRoyaleAgent:
             # handle_match_end() already: OK → Battle → wait_for_match_start for next match
 
         print("\n✓ Training complete.")
+        _print_training_summary(results)
         return results
 
 
@@ -695,6 +801,69 @@ def debug_calibrate():
 
 
 
+def plot_training_log(log_path: Path | None = None) -> None:
+    """
+    Plot training CSV: match vs total_reward, avg_loss, and rolling win rate.
+    If log_path is None, uses the most recent run_*.csv in clash_bot/logs/.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Install matplotlib to plot: pip install matplotlib")
+        return
+    if log_path is None:
+        if not LOG_DIR.exists():
+            print(f"No log dir: {LOG_DIR}. Run training first.")
+            return
+        csvs = list(LOG_DIR.glob("run_*.csv"))
+        if not csvs:
+            print(f"No run_*.csv in {LOG_DIR}. Run training first.")
+            return
+        log_path = max(csvs, key=lambda p: p.stat().st_mtime)
+    import csv as csv_module
+    rows = []
+    with open(log_path, newline="") as f:
+        for row in csv_module.reader(f):
+            rows.append(row)
+    if len(rows) < 2:
+        print("Log has no data rows.")
+        return
+    header, data = rows[0], rows[1:]
+    try:
+        match_idx = header.index("match")
+        reward_idx = header.index("total_reward")
+        loss_idx = header.index("avg_loss")
+        won_idx = header.index("won")
+    except ValueError:
+        print("Log missing expected columns.")
+        return
+    matches = [int(r[match_idx]) for r in data]
+    rewards = [float(r[reward_idx]) for r in data]
+    losses = [float(r[loss_idx]) for r in data]
+    wins = [int(r[won_idx]) for r in data]
+    window = min(10, len(matches))
+    rolling_wr = [100.0 * sum(wins[max(0, i - window + 1) : i + 1]) / min(i + 1, window) for i in range(len(wins))]
+
+    fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+    axes[0].plot(matches, rewards, "b.", markersize=4, alpha=0.7)
+    axes[0].set_ylabel("Total reward")
+    axes[0].set_title("Training progress")
+    axes[0].grid(True, alpha=0.3)
+    axes[1].plot(matches, losses, "r.", markersize=4, alpha=0.7)
+    axes[1].set_ylabel("Avg loss")
+    axes[1].grid(True, alpha=0.3)
+    axes[2].plot(matches, rolling_wr, "g-", linewidth=1.5)
+    axes[2].set_ylabel("Rolling win %")
+    axes[2].set_xlabel("Match")
+    axes[2].set_ylim(0, 100)
+    axes[2].grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = log_path.with_suffix(".png")
+    plt.savefig(out, dpi=120)
+    print(f"Saved plot: {out}")
+    plt.show()
+
+
 if __name__ == "__main__":
     import sys
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -702,6 +871,8 @@ if __name__ == "__main__":
 
     if "--debug" in sys.argv:
         debug_calibrate()
+    elif "--plot" in sys.argv:
+        plot_training_log()
     else:
         agent = ClashRoyaleAgent(device=device)
         agent.train(n_matches=200)

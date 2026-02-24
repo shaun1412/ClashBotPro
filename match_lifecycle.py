@@ -117,11 +117,11 @@ BATTLE_HI     = np.array([150, 255, 140], dtype=np.uint8)
 BATTLE_THRESH = 0.05
 BATTLE_TEMPLATE_THRESH = 0.58   # template match threshold (approximate match)
 
-# Elixir bar — pink, ONLY visible during a live match
-ELIXIR_ROI    = (0.5498, 0.9625, 0.9788, 0.9883)   # calibrated
-ELIXIR_LO     = np.array([200,  50, 150], dtype=np.uint8)
-ELIXIR_HI     = np.array([255, 160, 255], dtype=np.uint8)
-ELIXIR_THRESH = 0.05
+# Elixir bar — pink, ONLY visible during a live match (ROI slightly widened for robustness)
+ELIXIR_ROI    = (0.50, 0.955, 0.99, 0.995)
+ELIXIR_LO     = np.array([180,  40, 140], dtype=np.uint8)
+ELIXIR_HI     = np.array([255, 180, 255], dtype=np.uint8)
+ELIXIR_THRESH = 0.03   # lower so a single bad frame doesn't flip "match ended"
 
 # Winner ref images (optional but recommended — use your screenshots for reliable detection)
 WINNER_REF_BLUE = REF_DIR / "winner_blue.jpeg"   # crop of "Winner!" when agent wins (blue)
@@ -226,6 +226,18 @@ def is_match_live(hwnd) -> bool:
     """True while inside a live match (elixir bar is visible)."""
     arr = grab_full(hwnd)
     return color_frac(crop(arr, ELIXIR_ROI), ELIXIR_LO, ELIXIR_HI) >= ELIXIR_THRESH
+
+
+def is_match_live_confirmed(hwnd, num_checks: int = 5, interval: float = 0.4) -> bool:
+    """
+    Require multiple consecutive "elixir missing" checks before returning False.
+    Returns False only if the bar is missing for every check (avoids ending on a single glitch).
+    """
+    for _ in range(num_checks):
+        if is_match_live(hwnd):
+            return True
+        time.sleep(interval)
+    return False
 
 
 def is_end_screen(hwnd) -> bool:
