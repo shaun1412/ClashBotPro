@@ -14,6 +14,8 @@ Optional folders (created only when needed):
 
 Requirements:
     pip install torch torchvision opencv-python pywin32 pyautogui pillow numpy
+    Optional (for accurate elixir from on-screen number): pip install pytesseract
+    and install Tesseract: https://github.com/tesseract-ocr/tesseract
 
 Run:
     python rl_agent.py
@@ -155,32 +157,67 @@ def build_state_tensor(img: Image.Image, elixir: float) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Relative bounding box of the elixir bar in the client area: (x1, y1, x2, y2)
-# Defaults assume a standard portrait MuMu/game layout — calibrate with elixir_calibrate.py if needed.
-ELIXIR_BAR_ROI  = (0.5498, 0.9625, 0.9788, 0.9883)   # calibrated via elixir_calibrate.py
-# Bright pink of the Clash Royale elixir fill
-ELIXIR_COLOR_LO = np.array([200,  50, 150], dtype=np.uint8)
-ELIXIR_COLOR_HI = np.array([255, 160, 255], dtype=np.uint8)
+# Elixir: the number is shown as digits under the leftmost card at the very bottom.
+# ROI (x1, y1, x2, y2) as fraction of client area — adjust if your layout differs.
+ELIXIR_NUMBER_ROI = (0.18, 0.942, 0.34, 0.995)
+# Legacy: bar-fill fallback if OCR not available (same as before)
+ELIXIR_BAR_ROI   = (0.5498, 0.9625, 0.9788, 0.9883)
+ELIXIR_COLOR_LO  = np.array([200,  50, 150], dtype=np.uint8)
+ELIXIR_COLOR_HI  = np.array([255, 160, 255], dtype=np.uint8)
+
+
+def _elixir_from_ocr(crop_bgr: np.ndarray) -> float | None:
+    """Read elixir (0–10) from a small image of the number. Returns None if OCR fails or unavailable."""
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+    try:
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_RGB2GRAY) if crop_bgr.ndim == 3 else np.asarray(crop_bgr)
+        if gray.dtype != np.uint8:
+            gray = (gray * 255).astype(np.uint8) if gray.max() <= 1.0 else gray.astype(np.uint8)
+        # Improve contrast for digits
+        gray = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        text = pytesseract.image_to_string(
+            gray, config="-c tessedit_char_whitelist=0123456789 --psm 7"
+        ).strip()
+        digits = "".join(c for c in text if c.isdigit())
+        if not digits:
+            return None
+        val = int(digits) if len(digits) <= 2 else int(digits[:2])
+        return float(min(max(val, 0), 10))
+    except Exception:
+        return None
 
 
 def estimate_elixir(hwnd) -> float:
     """
-    Estimate elixir (0.0–10.0) by measuring the fraction of the elixir bar
-    that is filled with the characteristic purple colour.
-
-    Falls back to 5.0 (safe mid-value) on failure.
+    Read elixir (0.0–10.0) from the number under the leftmost card (OCR).
+    Falls back to bar-fill estimate if OCR unavailable; then to 5.0 on failure.
     """
     try:
         left, top, right, bottom = get_window_rect(hwnd)
-        w = right  - left
-        h = bottom - top
-        x1 = left + int(ELIXIR_BAR_ROI[0] * w)
-        y1 = top  + int(ELIXIR_BAR_ROI[1] * h)
-        x2 = left + int(ELIXIR_BAR_ROI[2] * w)
-        y2 = top  + int(ELIXIR_BAR_ROI[3] * h)
+        w, h = right - left, bottom - top
+        x1 = left + int(ELIXIR_NUMBER_ROI[0] * w)
+        y1 = top  + int(ELIXIR_NUMBER_ROI[1] * h)
+        x2 = left + int(ELIXIR_NUMBER_ROI[2] * w)
+        y2 = top  + int(ELIXIR_NUMBER_ROI[3] * h)
         img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
         arr = np.array(img)
-        mask  = np.all((arr >= ELIXIR_COLOR_LO) & (arr <= ELIXIR_COLOR_HI), axis=2)
-        frac  = mask.sum() / max(mask.size, 1)
+        # Try OCR first (number at bottom under leftmost card)
+        val = _elixir_from_ocr(arr)
+        if val is not None:
+            return round(val, 1)
+        # Fallback: bar fill
+        x1b = left + int(ELIXIR_BAR_ROI[0] * w)
+        y1b = top  + int(ELIXIR_BAR_ROI[1] * h)
+        x2b = left + int(ELIXIR_BAR_ROI[2] * w)
+        y2b = top  + int(ELIXIR_BAR_ROI[3] * h)
+        img_b = ImageGrab.grab(bbox=(x1b, y1b, x2b, y2b))
+        arr_b = np.array(img_b)
+        mask = np.all((arr_b >= ELIXIR_COLOR_LO) & (arr_b <= ELIXIR_COLOR_HI), axis=2)
+        frac = mask.sum() / max(mask.size, 1)
         return round(min(max(frac * 10.0, 0.0), 10.0), 1)
     except Exception:
         return 5.0
@@ -504,17 +541,17 @@ class ClashRoyaleAgent:
 
             time.sleep(self.STEP_SLEEP)
 
-            # ── Match end detection ───────────────────────────────────────
-            # Safety cap: a Clash Royale match can't exceed ~5 min = 600 steps
+            # ── Match end detection (only after minimum steps to avoid false positives) ──
+            MIN_STEPS_BEFORE_END = 25
             if step >= 600:
                 print("[Match] Step cap reached — forcing end.")
                 break
-            # Primary: detect end screen via colour signature
+            if step < MIN_STEPS_BEFORE_END:
+                continue
             if is_end_screen(hwnd):
                 print("[Match] End screen detected mid-loop — breaking.")
                 break
-            # Secondary: if elixir bar disappears mid-match something changed
-            if step > 10 and not is_match_live(hwnd):
+            if not is_match_live(hwnd):
                 print("[Match] Elixir bar gone — match likely ended.")
                 break
 

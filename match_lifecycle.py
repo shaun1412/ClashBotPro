@@ -102,7 +102,7 @@ WIN_PINK_THRESH = 0.04
 END_ROI      = (0.10, 0.05, 0.90, 0.35)
 END_GOLD_LO  = np.array([160, 110,  10], dtype=np.uint8)
 END_GOLD_HI  = np.array([255, 220, 110], dtype=np.uint8)
-END_THRESH   = 0.08
+END_THRESH   = 0.12   # stricter so gameplay isn't mistaken for end screen
 
 # OK / Continue button — blue-purple, centre-bottom of result screen
 OK_ROI    = (0.28, 0.68, 0.72, 0.86)
@@ -126,7 +126,7 @@ ELIXIR_THRESH = 0.05
 # Winner ref images (optional but recommended — use your screenshots for reliable detection)
 WINNER_REF_BLUE = REF_DIR / "winner_blue.jpeg"   # crop of "Winner!" when agent wins (blue)
 WINNER_REF_PINK = REF_DIR / "winner_pink.jpeg"   # crop of "Winner!" when opponent wins (pink)
-WINNER_REF_THRESH = 0.60   # min template match score to consider "end screen" / win or loss
+WINNER_REF_THRESH = 0.65   # min template match (stricter to avoid false end during gameplay)
 WINNER_REF_SCALES = (0.5, 0.7, 0.9, 1.1, 1.3)  # multi-scale matching for different resolutions
 # ROI to crop when capturing winner refs (banner usually in upper-center): x1, y1, x2, y2 frac
 WINNER_CAPTURE_ROI = (0.15, 0.12, 0.85, 0.45)

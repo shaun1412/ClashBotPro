@@ -25,8 +25,8 @@ from PIL import ImageGrab
 # Window title (case-insensitive). Set to the emulator/game window title.
 ANDROID_WINDOW_TITLE = "Android Device"
 
-TAP_DURATION = 0.05
-ACTION_DELAY = 0.15
+TAP_DURATION = 0.08
+ACTION_DELAY = 0.25
 
 # ──────────────────────────────────────────────
 # WINDOW UTILITIES
@@ -101,13 +101,15 @@ def relative_to_screen(hwnd, rel_x: float, rel_y: float) -> tuple[int, int]:
 
 # ──────────────────────────────────────────────
 # CARD & ARENA LAYOUT (portrait game view)
+# Centers must match where the card icons are; same as hand-detection ROIs in rl_agent.
 # ──────────────────────────────────────────────
 
+# Slot centers = center of each card slot (aligned with CARD_SLOT_ROIS in rl_agent)
 CARD_SLOTS = {
-    1: (0.285, 0.925),
-    2: (0.415, 0.925),
-    3: (0.545, 0.925),
-    4: (0.675, 0.925),
+    1: (0.265, 0.905),   # center of (0.22, 0.87, 0.31, 0.94)
+    2: (0.400, 0.905),
+    3: (0.535, 0.905),
+    4: (0.670, 0.905),
 }
 
 ARENA_ZONES = {
@@ -128,12 +130,13 @@ ARENA_ZONES = {
 # ──────────────────────────────────────────────
 
 def place_card(hwnd, card_slot: int, arena_zone: str):
-    """Tap the card in card_slot (1–4), then tap arena_zone to deploy."""
+    """Tap the card in card_slot (1–4), then tap arena_zone to deploy. Focuses window first."""
     if card_slot not in CARD_SLOTS:
         raise ValueError(f"card_slot must be 1–4, got {card_slot}")
     if arena_zone not in ARENA_ZONES:
         raise ValueError(f"arena_zone '{arena_zone}' not in ARENA_ZONES")
 
+    focus_window(hwnd)
     cx, cy = relative_to_screen(hwnd, *CARD_SLOTS[card_slot])
     print(f"[Action] Tapping card slot {card_slot}  → screen ({cx}, {cy})")
     tap_screen_coord(cx, cy)
