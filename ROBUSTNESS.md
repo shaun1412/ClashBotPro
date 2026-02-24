@@ -19,12 +19,12 @@ This doc covers: **what reference data to add**, **how to capture it**, **calibr
   3. Or run with `--debug` to get screenshots with slot boxes; crop each slot when each card appears and save as `cardname.png`.
 - **Tips:** Good lighting, no overlap with other UI. One ref per card is enough; you can add 2–3 per card (different games) and the code could take max match (not implemented yet).
 
-### Winner refs (reliable end screen + win/loss)
+### Winner detection (no refs needed)
 
-- **Where:** `clash_bot/lifecycle_refs/`
-- **Files:** `winner_blue.png`, `winner_pink.png` (or `.jpeg` if you use that)
-- **What:** Crop of the **"Winner!" banner** when **you** win (blue) and when the **opponent** wins (pink).
-- **How:** Finish one game as winner, screenshot, crop the banner area. Finish one as loser, screenshot, crop the banner. Save as above.
+Win/loss is detected by **position** of the "Winner!" banner:
+- **Opponent wins:** banner in the **top 30%** of the screen
+- **We win:** banner in the **lower 70%** of the screen
+Tune `TOP_ROI` / `LOWER_ROI` in `match_lifecycle.py` if your layout differs.
 
 ### Elixir number
 
@@ -50,7 +50,7 @@ This doc covers: **what reference data to add**, **how to capture it**, **calibr
 
 - **Card confidence:** `HAND_DETECT_THRESH` in `rl_agent.py` (default 0.48). Only slots with template match ≥ this are reported. **Increase** (e.g. 0.55) if you get wrong cards; **decrease** (e.g. 0.42) if too many slots are left empty.
 - **Ref size:** `HAND_REF_SIZE` (default 64). Larger = more detail but slower; keep ref images at least this size (they get resized to this).
-- **Winner ref threshold:** `WINNER_REF_THRESH` in `match_lifecycle.py`. Raise if end screen is detected during gameplay; lower if real end screen is missed.
+- **Winner position:** `TOP_ROI` (0–30%) vs `LOWER_ROI` (30–100%) in `match_lifecycle.py`. Adjust fractions if your "Winner!" placement differs. `WIN_COLOR_THRESH` controls sensitivity.
 
 ---
 
@@ -81,7 +81,7 @@ This doc covers: **what reference data to add**, **how to capture it**, **calibr
 
 ### Match end and lifecycle
 
-- **End detection:** Prefer **winner refs** (blue/pink) over gold bar. Use **timer 0:00** as a strong signal; require either ref match or timer 0:00 before trusting “elixir bar gone”.
+- **End detection:** Uses gold bar + position (top 30% vs lower 70% for "Winner!"). Use **timer 0:00** as a strong signal; require either position match or timer 0:00 before trusting “elixir bar gone”.
 - **No guessing:** Card hand is only what passes the confidence threshold; if no refs, hand is empty and only WAIT is valid. No random cards.
 
 ---
@@ -89,7 +89,7 @@ This doc covers: **what reference data to add**, **how to capture it**, **calibr
 ## 5. Quick Checklist
 
 - [ ] Add all 8 card refs to `clash_bot/card_refs/` (crops of in-game hand slots).
-- [ ] Add `winner_blue.png` and `winner_pink.png` to `clash_bot/lifecycle_refs/`.
+- [ ] Win/loss uses position (top 30% vs lower 70%) — no winner refs needed.
 - [ ] Run elixir calibration if you rely on bar fill; else set `ELIXIR_NUMBER_ROI` so the digit is in frame.
 - [ ] Set `TIMER_ROI` so the top-right timer is fully inside the crop.
 - [ ] Tune `HAND_DETECT_THRESH` so you get 4 cards when refs are good and no wrong cards.
